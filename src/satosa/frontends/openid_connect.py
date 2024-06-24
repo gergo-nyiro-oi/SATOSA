@@ -46,6 +46,11 @@ from satosa.internal import InternalData
 logger = logging.getLogger(__name__)
 
 
+class MirrorPublicSubjectIdentifierFactory(HashBasedSubjectIdentifierFactory):
+    def create_public_identifier(self, user_id):
+        return user_id
+
+
 class OpenIDConnectFrontend(FrontendModule):
     """
     A OpenID Connect frontend module
@@ -75,7 +80,10 @@ class OpenIDConnectFrontend(FrontendModule):
         )
 
         sub_hash_salt = self.config.get("sub_hash_salt", rndstr(16))
-        authz_state = _init_authorization_state(provider_config, db_uri, sub_hash_salt)
+        mirror_public = self.config.get("sub_mirror_public", False)
+        authz_state = _init_authorization_state(
+            provider_config, db_uri, sub_hash_salt, mirror_public
+        )
 
         client_db_uri = self.config.get("client_db_uri")
         cdb_file = self.config.get("client_db_path")
@@ -89,7 +97,6 @@ class OpenIDConnectFrontend(FrontendModule):
         else:
             cdb = {}
 
-        self.endpoint_baseurl = "{}/{}".format(self.base_url, self.name)
         self.provider = _create_provider(
             provider_config,
             self.endpoint_baseurl,
@@ -165,6 +172,9 @@ class OpenIDConnectFrontend(FrontendModule):
         :rtype: list[(str, ((satosa.context.Context, Any) -> satosa.response.Response, Any))]
         :raise ValueError: if more than one backend is configured
         """
+        provider_config = ("^.well-known/openid-configuration$", self.provider_config)
+        jwks_uri = ("^{}/jwks$".format(self.endpoint_basepath), self.jwks)
+
         backend_name = None
         if len(backend_names) != 1:
             # only supports one backend since there currently is no way to publish multiple authorization endpoints
@@ -181,16 +191,13 @@ class OpenIDConnectFrontend(FrontendModule):
         else:
             backend_name = backend_names[0]
 
-        provider_config = ("^.well-known/openid-configuration$", self.provider_config)
-        jwks_uri = ("^{}/jwks$".format(self.name), self.jwks)
-
         if backend_name:
             # if there is only one backend, include its name in the path so the default routing can work
             auth_endpoint = "{}/{}/{}/{}".format(self.base_url, backend_name, self.name, AuthorizationEndpoint.url)
             self.provider.configuration_information["authorization_endpoint"] = auth_endpoint
             auth_path = urlparse(auth_endpoint).path.lstrip("/")
         else:
-            auth_path = "{}/{}".format(self.name, AuthorizationEndpoint.url)
+            auth_path = "{}/{}".format(self.endpoint_basepath, AuthorizationEndpoint.url)
 
         authentication = ("^{}$".format(auth_path), self.handle_authn_request)
         url_map = [provider_config, jwks_uri, authentication]
@@ -200,7 +207,7 @@ class OpenIDConnectFrontend(FrontendModule):
                 self.endpoint_baseurl, TokenEndpoint.url
             )
             token_endpoint = (
-                "^{}/{}".format(self.name, TokenEndpoint.url), self.token_endpoint
+                "^{}/{}".format(self.endpoint_basepath, TokenEndpoint.url), self.token_endpoint
             )
             url_map.append(token_endpoint)
 
@@ -208,13 +215,13 @@ class OpenIDConnectFrontend(FrontendModule):
                 "{}/{}".format(self.endpoint_baseurl, UserinfoEndpoint.url)
             )
             userinfo_endpoint = (
-                "^{}/{}".format(self.name, UserinfoEndpoint.url), self.userinfo_endpoint
+                "^{}/{}".format(self.endpoint_basepath, UserinfoEndpoint.url), self.userinfo_endpoint
             )
             url_map.append(userinfo_endpoint)
 
         if "registration_endpoint" in self.provider.configuration_information:
             client_registration = (
-                "^{}/{}".format(self.name, RegistrationEndpoint.url),
+                "^{}/{}".format(self.endpoint_basepath, RegistrationEndpoint.url),
                 self.client_registration,
             )
             url_map.append(client_registration)
@@ -460,7 +467,7 @@ def _create_provider(
     return provider
 
 
-def _init_authorization_state(provider_config, db_uri, sub_hash_salt):
+def _init_authorization_state(provider_config, db_uri, sub_hash_salt, mirror_public):
     if db_uri:
         authz_code_db = StorageBase.from_uri(
             db_uri,
@@ -499,8 +506,14 @@ def _init_authorization_state(provider_config, db_uri, sub_hash_salt):
         ]
         if k in provider_config
     }
+
+    subject_id_factory = (
+        MirrorPublicSubjectIdentifierFactory(sub_hash_salt)
+        if mirror_public
+        else HashBasedSubjectIdentifierFactory(sub_hash_salt)
+    )
     return AuthorizationState(
-        HashBasedSubjectIdentifierFactory(sub_hash_salt),
+        subject_id_factory,
         authz_code_db,
         access_token_db,
         refresh_token_db,
